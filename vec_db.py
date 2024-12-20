@@ -28,7 +28,7 @@ class VecDB:
                 os.remove(self.db_path)
             self.generate_database(db_size)
         else:
-            pass
+            self._load_index()
 
     def generate_database(self, size: int) -> None:
         rng = np.random.default_rng(DB_SEED_NUMBER)
@@ -119,7 +119,6 @@ class VecDB:
         self._save_index()
 
     def retrieve(self, query: np.ndarray, top_k=5, top_level1_k=3, top_level2_k=5):
-        self._load_index()
         heap = []  # Min-heap for top-k results
 
         # Step 1: Retrieve top-level centroids (level 1)
