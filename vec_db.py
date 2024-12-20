@@ -3,6 +3,7 @@ import numpy as np
 import os
 import pickle
 from typing import Dict, List, Annotated
+import heapq
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
@@ -13,7 +14,7 @@ class VecDB:
     def __init__(self, database_file_path = "saved_db.csv", index_file_path = "index.csv", new_db = True, db_size = None) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
-        self.nlist = 20  # Number of coarse clusters
+        self.nlist = 60  # Number of coarse clusters
         self.nsubquantizers = 4  # Number of subquantizers for PQ
         self.centroids_level1 = []
         self.inverted_lists_level1 = {}
@@ -118,29 +119,36 @@ class VecDB:
         self._save_index()
 
     def retrieve(self, query: np.ndarray, top_k=5, top_level1_k=3, top_level2_k=5):
+        heap = []  # Min-heap for top-k results
+
+        # Step 1: Retrieve top-level centroids (level 1)
         centroid_scores_level1 = []
         for i, centroid in enumerate(self.centroids_level1):
             score = self._cal_score(query, centroid)
             centroid_scores_level1.append((score, i))
-        
+
         closest_level1_centroids = [x[1] for x in sorted(centroid_scores_level1, reverse=True)[:top_level1_k]]
-        
+
+        # Step 2: Retrieve nested centroids (level 2)
         candidates = []
         for level1_idx in closest_level1_centroids:
             for nested_centroid_idx, nested_centroid in enumerate(self.nested_centroids.get(level1_idx, [])):
                 score = self._cal_score(query, nested_centroid)
-                candidates.append((score, level1_idx, nested_centroid_idx))
-        
-        candidates = sorted(candidates, reverse=True)[:top_level2_k]
-        
-        final_candidates = []
+                heapq.heappush(candidates, (score, level1_idx, nested_centroid_idx))
+                if len(candidates) > top_level2_k:
+                    heapq.heappop(candidates)  # Keep only top_k candidates
+
+        # Step 3: Retrieve final candidates
         for score, level1_idx, nested_centroid_idx in candidates:
             vector_ids = self.nested_inverted_lists.get(level1_idx, {}).get(nested_centroid_idx, [])
             for vector_id in vector_ids:
-                final_candidates.append((self._cal_score(query, self.get_one_row(vector_id)), vector_id))
-        
-        final_candidates = sorted(final_candidates, reverse=True)[:top_k]
-        return [x[1] for x in final_candidates]
+                heapq.heappush(heap, (self._cal_score(query, self.get_one_row(vector_id)), vector_id))
+                if len(heap) > top_k:
+                    heapq.heappop(heap)  # Keep only top_k results
+
+        # Return top-k results
+        final_candidates = [x[1] for x in heap]
+        return final_candidates
 
     def _cal_score(self, vec1, vec2):
         dot_product = np.dot(vec1, vec2)
