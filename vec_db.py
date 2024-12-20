@@ -9,17 +9,55 @@ DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
 DIMENSION = 70
 
+
+class LSH:
+    def __init__(self, num_hashes=13, dimension=70, seed=42):
+        """
+        num_hashes: Number of hash functions (hyperplanes) to use
+        dimension: Dimensionality of the vectors
+        """
+        self.num_hashes = num_hashes
+        self.dimension = dimension
+        self.seeds = np.random.default_rng(seed)
+        
+        # Randomly initialize hyperplanes (each row is a hyperplane)
+        self.hyperplanes = self.seeds.normal(0, 1, size=(num_hashes, dimension))
+
+    def _hash(self, vector: np.ndarray) -> str:
+        """
+        Hash the vector using the hyperplanes and return the hash value as a string.
+        """
+         # Ensure that the vector is a 1D array (shape should be (70,))
+        vector = vector.flatten()  # Flatten the vector to shape (70,)
+        # For each hyperplane, take the dot product of the vector and the hyperplane
+        # If the dot product is positive, the hash bit is 1, else it's 0
+        hash_bits = (np.dot(self.hyperplanes, vector) > 0).astype(int)
+        return ''.join(str(bit) for bit in hash_bits)
+
+    def hash_vectors(self, data: np.ndarray) -> Dict[str, List[int]]:
+        """
+        Hash all vectors and store them in a dictionary where the key is the hash value and the value is the list of vector indices.
+        """
+        hash_buckets = {}
+        for idx, vector in enumerate(data):
+            hash_value = self._hash(vector)
+            if hash_value not in hash_buckets:
+                hash_buckets[hash_value] = []
+            hash_buckets[hash_value].append(idx)
+        return hash_buckets
+
 class VecDB:
 
     def __init__(self, database_file_path = "saved_db.csv", index_file_path = "index.csv", new_db = True, db_size = None) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
-        self.nlist = 60  # Number of coarse clusters
-        self.nsubquantizers = 4  # Number of subquantizers for PQ
+        self.nlist = 65  # Number of coarse clusters
+        self.nsubquantizers = 6  # Number of subquantizers for PQ
         self.centroids_level1 = []
         self.inverted_lists_level1 = {}
         self.nested_centroids = {}
         self.nested_inverted_lists = {}
+        self.lsh = LSH(num_hashes=13, dimension=DIMENSION)
 
         if new_db:
             if db_size is None:
@@ -93,6 +131,8 @@ class VecDB:
         self.inverted_lists_level1 = {i: [] for i in range(self.nlist)}
         for idx, cluster_idx in enumerate(cluster_assignments_level1):
             self.inverted_lists_level1[cluster_idx].append(idx)
+            
+        self.hash_buckets = self.lsh.hash_vectors(data)
 
         # Level 2 PQ for each Level 1 cluster
         self.nested_centroids = {}
@@ -118,33 +158,27 @@ class VecDB:
         
         self._save_index()
 
+    
+    
     def retrieve(self, query: np.ndarray, top_k=5, top_level1_k=3, top_level2_k=5):
         heap = []  # Min-heap for top-k results
 
-        # Step 1: Retrieve top-level centroids (level 1)
-        centroid_scores_level1 = []
-        for i, centroid in enumerate(self.centroids_level1):
-            score = self._cal_score(query, centroid)
-            centroid_scores_level1.append((score, i))
-
-        closest_level1_centroids = [x[1] for x in sorted(centroid_scores_level1, reverse=True)[:top_level1_k]]
-
-        # Step 2: Retrieve nested centroids (level 2)
+        # Step 1: Use LSH to hash the query vector
+        query_hash = self.lsh._hash(query)
+        
+        # Step 2: Retrieve candidates from the same hash bucket
         candidates = []
-        for level1_idx in closest_level1_centroids:
-            for nested_centroid_idx, nested_centroid in enumerate(self.nested_centroids.get(level1_idx, [])):
-                score = self._cal_score(query, nested_centroid)
-                heapq.heappush(candidates, (score, level1_idx, nested_centroid_idx))
-                if len(candidates) > top_level2_k:
-                    heapq.heappop(candidates)  # Keep only top_k candidates
+        if query_hash in self.hash_buckets:
+            # Only consider vectors in the same bucket
+            for vector_id in self.hash_buckets[query_hash]:
+                candidates.append((self._cal_score(query, self.get_one_row(vector_id)), vector_id))
 
-        # Step 3: Retrieve final candidates
-        for score, level1_idx, nested_centroid_idx in candidates:
-            vector_ids = self.nested_inverted_lists.get(level1_idx, {}).get(nested_centroid_idx, [])
-            for vector_id in vector_ids:
-                heapq.heappush(heap, (self._cal_score(query, self.get_one_row(vector_id)), vector_id))
-                if len(heap) > top_k:
-                    heapq.heappop(heap)  # Keep only top_k results
+        # Step 3: Sort candidates and retrieve top-k results
+        candidates.sort(reverse=True, key=lambda x: x[0])  # Sort by score
+        for score, vector_id in candidates[:top_k]:
+            heapq.heappush(heap, (score, vector_id))
+            if len(heap) > top_k:
+                heapq.heappop(heap)
 
         # Return top-k results
         final_candidates = [x[1] for x in heap]
